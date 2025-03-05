@@ -1,6 +1,20 @@
+import hashlib
+
 import psycopg2
+
 import tomllib
+import string
 from tabulate import tabulate
+
+import os
+import random
+import winreg
+
+from ctypes import windll
+from hashlib import sha512
+
+import crypto
+
 class SecApp:
     def secinput(self, text):
         special_chars = "/?*'-"
@@ -27,11 +41,15 @@ class DBClass:
         self.host = host
         self.port = port
 
-    def request(self,command:str):
+    def request(self,command:str,list_args = None):
         try:
             with psycopg2.connect(database=self.dbname, user=self.user, password=self.passw, port=self.port, host=self.host) as db:
                 with db.cursor() as session:
-                    session.execute(command)
+                    if list_args==None:
+                        session.execute(command)
+                    else:
+                        session.execute(command, list_args)
+
                     if command.split()[0].lower()=='select':
                         return session.fetchall()
                     return 0
@@ -196,6 +214,47 @@ class Admin(User):
             print("Скасування операції!")
             return -2
 
+def handle_table(table:list[tuple], indicator:int, key):
+    rtable = []
+    for row in table:
+        r = []
+        for entry in row[:2]:
+            if indicator==0:
+                data = bytes(entry,encoding='utf-8')
+            elif indicator==1:
+                data = bytes(entry, encoding='windows-1256')
+            else:
+                return -1
+            r.append(crypto.CryptoAPI(indicator, key, data))
+
+        rtable.append(tuple(r + list(row[2:])))
+
+    return rtable
+
+def read_key_reg(v_name):
+    key = winreg.HKEY_CURRENT_USER
+    sub_key = 'SOFTWARE\\Shabanov'
+    try:
+        hkey = winreg.OpenKey(key,sub_key)
+        val = winreg.QueryValueEx(hkey,v_name)
+        winreg.CloseKey(hkey)
+    except FileNotFoundError:
+        return -1
+
+    return val
+
+def write_to_reg(value:str, v_name):
+    key = winreg.HKEY_CURRENT_USER
+    sub_key = 'SOFTWARE\\Shabanov'
+    hkey = winreg.CreateKey(key,sub_key)
+    winreg.SetValueEx(hkey,v_name,0, winreg.REG_SZ, value)
+    winreg.CloseKey(hkey)
+
+def get_two_symb()->str:
+    lsymb = string.ascii_letters+''.join([chr(i) for i in range(48, 58)])
+    srnd1 = lsymb[random.randint(0,len(lsymb)-1)]
+    srnd2 = lsymb[random.randint(0, len(lsymb) - 1)]
+    return srnd1+srnd2
 
 def main(db_session:DBClass):
     num_attempts = 2
@@ -251,13 +310,101 @@ def main(db_session:DBClass):
 
                 case _: print('Команду не знайдено!')
 
-    except KeyboardInterrupt:
-        print("Вихід з програми!")
+    except (KeyboardInterrupt, EOFError):
+        print("Вихід з програми...")
+        plaintext = db_session.request('SELECT * FROM users;')
+        db_session.request("DROP TABLE users;")
+        comm = "DELETE FROM secusers;"
+        db_session.request(comm)
+
+        key = read_key_reg('secret')[0]
+        key = key[:len(key)-2]+get_two_symb()
+        print("Key:"+key)
+        write_to_reg(key, 'secret')
+
+        key = hashlib.sha512(bytes(key, encoding='utf-8')).digest()[:16]
+        comm = f"INSERT INTO secusers(username,passw, is_blocked, set_pass_policy) VALUES %s;"
+        for i in handle_table(plaintext, 0, key):
+            db_session.request(comm,(i,))
+
+        print("Роботу завершено!")
+
+
+def get_info():
+    current_user = os.getlogin()
+    computer_name = os.environ['COMPUTERNAME']
+    win_path = os.environ['SystemRoot']
+    sys_file_path = win_path+'\\System32'
+
+    #GetTypeKeyboardAndSubtype
+    type_keyboard = str(windll.user32.GetKeyboardType(0))
+    subtype = str(windll.user32.GetKeyboardType(1))
+    screen_size = str(windll.user32.GetSystemMetrics(0)) +',' + str(windll.user32.GetSystemMetrics(1))
+    set_disks = ''.join(i for i in os.listdrives())
+
+    label_vol = os.getcwd().split('\\')[0]
+    return f"{current_user};{computer_name};{win_path};{sys_file_path};{type_keyboard};{subtype};{screen_size};{set_disks};{label_vol};"
+
+def gencerf(data:str):
+    return sha512(bytes(data, encoding='utf-8')).hexdigest()
+
+def init(dbsession:DBClass, passphrase:bytes):
+    init_table = '''CREATE TABLE secusers (
+                    username varchar(255) PRIMARY KEY,
+                    passw varchar(255),
+                    is_blocked boolean NOT NULL DEFAULT 'No',
+                    set_pass_policy boolean NOT NULL DEFAULT 'No'
+                );
+                '''
+
+
+    hpass = hashlib.sha512(passphrase).digest()[:16]
+    init_admin, init_passw = (crypto.CryptoAPI(0, hpass, b'admin')
+                              , crypto.CryptoAPI(0, hpass, b''))
+
+    init_table = init_table + f"INSERT INTO secusers (username, passw) VALUES('{init_admin}', '{init_passw}');"
+
+    db_session.request(init_table)
+
+def create_temp_table(dbsession:DBClass):
+    temp_table = '''CREATE TABLE users (
+                                username varchar(255) PRIMARY KEY,
+                                passw varchar(255),
+                                is_blocked boolean NOT NULL DEFAULT 'No',
+                                set_pass_policy boolean NOT NULL DEFAULT 'No'
+                            );'''
+
+    db_session.request(temp_table)
 
 if __name__=='__main__':
-    with open('conf.toml', 'rb') as tf:
-        data = tomllib.load(tf)
+    if gencerf(get_info())!=read_key_reg('Signature')[0]:
+        print("Помилка виконання!")
+        exit(-1)
+    else:
+        with open('./conf.toml', 'rb') as tf:
+            data = tomllib.load(tf)
 
-    dt_table = data['database']
-    db_session = DBClass(dt_table['name'],dt_table['user'],dt_table['password'],dt_table['host'],dt_table['port'])
-    main(db_session)
+        dt_table = data['database']
+        db_session = DBClass(dt_table['name'],dt_table['user'],dt_table['password'],dt_table['host'],dt_table['port'])
+        if isinstance(db_session.request("SELECT * FROM secusers;"), psycopg2.errors.UndefinedTable):
+            passkey = input("Будь ласка, введіть правильну фразу, за якою дані буде зашифровано:")
+            write_to_reg(passkey, 'secret')
+            init(db_session,bytes(passkey, encoding='utf-8'))
+        else:
+            passkey = input("Будь ласка, введіть правильну фразу:")
+
+            if not read_key_reg('secret')[0]==passkey:
+                print("Паролі не співпадають")
+                exit(-1)
+
+        passkey = hashlib.sha512(bytes(passkey, encoding='utf-8')).digest()[:16]
+
+        create_temp_table(db_session)
+
+        entries = db_session.request("SELECT * FROM secusers;")
+
+        comm = f"INSERT INTO users(username,passw, is_blocked, set_pass_policy) VALUES %s;"
+
+        for i in handle_table(entries, 1, passkey):
+            db_session.request(comm, (i,))
+        main(db_session)
